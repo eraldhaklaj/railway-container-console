@@ -1,7 +1,7 @@
 /**
- * Config is read once at boot and validated loudly. A misconfigured deploy
- * should fail on startup with a readable message, not at 3am on the first
- * request that happens to need the variable.
+ * Configuration is resolved once at startup and validated eagerly, so a
+ * misconfigured deployment fails fast at boot rather than on the first request
+ * that happens to depend on the missing value.
  */
 
 function required(name: string): string {
@@ -18,11 +18,11 @@ export interface Config {
   railwayToken: string;
   projectId: string;
   environmentId: string;
-  /** Shared secret the UI must present. This app can spend real money, so it is not optional. */
+  /** Shared secret required on every API call. Not optional: the API is billable. */
   accessKey: string;
-  /** Hard ceiling on how many containers this console will run at once. */
+  /** Upper bound on concurrent containers. */
   maxContainers: number;
-  /** Images a caller is allowed to run. Empty means allow anything. */
+  /** Permitted images. An empty list disables the allowlist. */
   allowedImages: string[];
   port: number;
 }
