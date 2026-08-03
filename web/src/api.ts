@@ -17,7 +17,7 @@ export interface Meta {
   maxContainers: number;
 }
 
-/** Statuses that will not change on their own. Polling stops when everything is here. */
+/** Terminal statuses. Polling halts once every row reports one of these. */
 const TERMINAL = new Set<DeploymentStatus>([
   "SUCCESS", "FAILED", "CRASHED", "REMOVED", "SKIPPED", "UNKNOWN",
 ]);
@@ -60,7 +60,8 @@ export const fetchContainers = () => call<Container[]>("/containers");
 export const spinUp = (image: string, name: string) =>
   call<{ id: string; name: string }>("/containers", {
     method: "POST",
-    // Guards against a double-click or a retry creating two billable services.
+    // Scopes the retry window so a double submit or network retry cannot
+    // create a second billable service.
     headers: { "idempotency-key": crypto.randomUUID() },
     body: JSON.stringify({ image, name }),
   });
