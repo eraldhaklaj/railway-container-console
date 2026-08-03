@@ -1,87 +1,97 @@
 # Container console
 
-Spins containers up and down on Railway through the public GraphQL API. React + TypeScript front end, Node + TypeScript API, deployed on Railway as a single service.
-
-Built for Railway's Senior Full-Stack Engineer (Product) take-home.
+Creates and destroys Railway services from a browser, driving the platform's public GraphQL API. React + TypeScript client, Node + TypeScript API, deployed as a single Railway service.
 
 ---
 
-## Running it
+## Running locally
 
 ```bash
 npm install
-cp .env.example .env      # fill it in, see below
-npm run dev               # api on :3000, vite on :5173 proxying /api
+cp .env.example .env
+npm run dev            # API on :3000, Vite on :5173 proxying /api
 ```
 
-Production is one process: `npm run build` compiles the front end to `web/dist` and the API to `dist`, then `npm start` serves both from the same origin.
+Production runs as one process. `npm run build` compiles the client to `web/dist` and the API to `dist`; `npm start` serves both from the same origin.
 
-### Environment
+## Configuration
 
-| Variable | What it is |
+| Variable | Purpose |
 | --- | --- |
-| `RAILWAY_API_TOKEN` | Account or workspace token from railway.com/account/tokens |
-| `RAILWAY_PROJECT_ID` | The one project this console may touch, from the project URL |
-| `RAILWAY_ENVIRONMENT_ID` | Environment within that project, usually `production` |
-| `ACCESS_KEY` | Shared secret the UI presents. `openssl rand -hex 24` |
-| `MAX_CONTAINERS` | Ceiling on concurrent containers, default 5 |
-| `ALLOWED_IMAGES` | Comma-separated allowlist |
+| `RAILWAY_API_TOKEN` | Account or workspace token, from railway.com/account/tokens |
+| `RAILWAY_PROJECT_ID` | The only project this deployment may act on |
+| `RAILWAY_ENVIRONMENT_ID` | Environment within that project |
+| `ACCESS_KEY` | Shared secret required on every API call. `openssl rand -hex 24` |
+| `MAX_CONTAINERS` | Concurrency ceiling, default 5 |
+| `ALLOWED_IMAGES` | Comma-separated image allowlist |
+
+The configured project must not be the project this console is deployed into. A spin-down issues `serviceDelete`, which would otherwise be able to remove the console itself.
 
 ---
 
-## The four decisions worth defending
+## Architecture
 
-**1. The token never reaches the browser.** Every Railway call goes through the Node API. The obvious reason is that a Railway account token in client-side JavaScript is an account takeover. The less obvious one is that keeping it server-side is what makes decisions 2 and 3 enforceable at all.
+**Client → Node API → Railway GraphQL.** The client never talks to Railway directly.
 
-**2. Project and environment are server config, not request parameters.** The client can't name a project. If it could, anyone who found the URL could create services anywhere that token reaches, and the token reaches everything in the workspace. Scoping at the boundary means the worst case is bounded by config rather than by whatever the caller typed.
+### Token isolation
 
-**3. It's gated, and the image list is an allowlist.** This app has a button that provisions real infrastructure and spends real money on a real account. Deployed on a public URL with no gate, it's a crypto miner with extra steps: free compute, someone else's card. So there's a shared secret in front of the API, an allowlist of images rather than a free-text field, and a hard ceiling on concurrent containers. None of that is sophisticated. All of it is the difference between a demo and a liability.
+The account token is confined to `src/railway.ts` and never reaches the browser. Beyond the obvious credential exposure, server-side confinement is what makes the scoping and allowlisting below enforceable rather than advisory.
 
-**4. Spin-up is idempotent.** `POST /api/containers` honours an `Idempotency-Key`, and the client sends one per attempt. Creating a service is a billable side effect, so a double click, a flaky connection, or a retry must not produce two. The store is an in-memory `Map` with a ten minute TTL, which is honest for a single instance and wrong the moment there are two. Noted below rather than papered over.
+### Request-independent scoping
+
+Project and environment identifiers come from configuration, never from request input. A Railway account token authorises every project in the workspace, so accepting a project ID from the client would widen the blast radius from one project to all of them. The worst case is bounded by deployment config instead of by caller input.
+
+### Access control and image allowlisting
+
+Every endpoint provisions or destroys billable infrastructure on a URL reachable from the open internet. Three controls apply:
+
+- a shared secret on all `/api` routes, checked before any handler runs
+- an image allowlist rather than format validation, since the token can pull and run arbitrary public images
+- a hard ceiling on concurrent services
+
+`/healthz` is deliberately unauthenticated so platform health checks can reach it.
+
+### Idempotent creation
+
+`POST /api/containers` honours an `Idempotency-Key` header; the client generates one per attempt. Service creation is billable and not naturally idempotent, so a double submit or a network-level retry would otherwise produce two services.
+
+The store is an in-process `Map` with a 10 minute TTL. This constrains the service to a single replica, because a replayed key must reach the process that recorded it. Moving to Redis or a uniquely-indexed table is the first item on the roadmap below.
+
+### Deployment state in the client
+
+Deployments transition `QUEUED → BUILDING → DEPLOYING → SUCCESS`, or terminate in `FAILED` / `CRASHED`. Three consequences:
+
+- **Polling is conditional.** `refetchInterval` returns `false` once every row reports a terminal status, and 4000ms otherwise. An unconditional interval would poll a settled list indefinitely.
+- **Deletion is optimistic, creation is not.** Removal is applied to the cache immediately and rolled back on failure, since the outcome is unambiguous. Creation waits for the server, because rendering a service that may fail to create would require retracting it.
+- **Upstream errors propagate.** Railway returns HTTP 200 with an `errors` array on failure, so the client inspects the body before the status and surfaces the original message.
 
 ---
-
-## How the UI handles state
-
-Deployments move `QUEUED → BUILDING → DEPLOYING → SUCCESS`, or fall out into `FAILED` / `CRASHED`. Three things follow from that:
-
-- **Polling stops when nothing can change.** TanStack Query's `refetchInterval` returns `false` once every row is in a terminal state, and 4s otherwise. Polling a settled list forever is the default mistake and it's free to avoid.
-- **Deletion is optimistic, creation is not.** Spin-down removes the row immediately and rolls back on failure, because waiting on a round trip to see a thing disappear feels broken. Spin-up waits, because inventing a row for a service that may fail to create is a lie the UI then has to retract.
-- **Railway's error message is passed through.** GraphQL reports failures in a 200 response body, so the client checks `errors` before status, and the real message reaches the user instead of "something went wrong."
 
 ## API
 
-| | |
+| Route | Behaviour |
 | --- | --- |
-| `GET /healthz` | Unauthenticated, for the platform health check |
-| `GET /api/meta` | Allowed images and the ceiling, so the UI can't drift from the server's rules |
-| `GET /api/containers` | Services in the scoped project with their latest deployment status |
-| `POST /api/containers` | Spin up. Accepts `Idempotency-Key` |
-| `DELETE /api/containers/:serviceId` | Spin down, removes the service and its deployments |
-| `POST /api/deployments/:id/stop` | Halt a deployment, leaving the service in place |
+| `GET /healthz` | Unauthenticated liveness check |
+| `GET /api/meta` | Allowlist and ceiling, so the client cannot drift from server constraints |
+| `GET /api/containers` | Services in the scoped project with latest deployment status |
+| `POST /api/containers` | Creates a service. Accepts `Idempotency-Key` |
+| `DELETE /api/containers/:serviceId` | `serviceDelete`: removes the service and its deployments |
+| `POST /api/deployments/:id/stop` | `deploymentStop`: halts the deployment, service remains |
 
-Both destructive paths exist on purpose. `serviceDelete` is the real spin-down. `deploymentStop` is the softer one that keeps the service so it can be redeployed, which is usually what you want when you're debugging rather than cleaning up.
-
----
-
-## What I'd do next
-
-Roughly in the order I'd actually do it.
-
-**Move idempotency out of process.** The in-memory map is correct for one instance and silently wrong for two, because a retry can land on the replica that has never seen the key. Redis with the same TTL, or a `request_id` unique index in Postgres.
-
-**Replace polling with the subscription.** Railway exposes `wss://backboard.railway.com/graphql/v2`. Polling every 4s is fine for five containers and obviously wrong for five hundred. The reason I didn't start there is that a subscription needs reconnect, backfill on reconnect, and a fallback when the socket won't open, and polling is the honest version of the small thing.
-
-**Give spin-up a job, not a request.** Right now the HTTP request is the unit of work, so a request that dies mid-flight leaves a service created and nobody tracking it. Real answer is to write an intent record, return immediately, and let a worker drive it to a terminal state with retries. This is where I'd expect Temporal to come in, and it's the piece I have least direct experience with: my async backend work has been worker jobs and scheduled pipelines rather than durable workflow orchestration.
-
-**Per-user auth and an audit trail.** A shared key tells you someone was allowed to do it, not who did it. Real accounts, and a row per action with actor, image, service id and outcome. On a tool that spends money, "who spun this up" is the first question anyone asks.
-
-**Cost visibility.** The console shows what is running but not what it costs. Usage per service, and a projected monthly figure, would change how people use it.
-
-**Tests worth having.** Right now there are none, which is the honest state of a take-home. The ones I'd write first are the ones covering decisions rather than syntax: that the allowlist rejects an unlisted image, that the ceiling holds, that a replayed idempotency key doesn't create twice, and that a GraphQL error body surfaces its message rather than a generic 500.
+Both destructive routes are exposed because they serve different cases. `serviceDelete` is a teardown. `deploymentStop` halts a running deployment while preserving the service for redeploy, which is the appropriate operation when debugging rather than cleaning up.
 
 ---
 
-## Things I got wrong on the way
+## Roadmap
 
-`vite build --root web` isn't valid, the root is positional. Ten minutes lost to a build that failed only in CI-shaped conditions and never in dev, which is a decent argument for running the production build locally before assuming it works.
+**Distributed idempotency.** The in-process store is correct at one replica and silently incorrect at two, since a retry can land on an instance that has no record of the key. Redis with the same TTL, or a `request_id` unique constraint in Postgres.
+
+**Subscriptions in place of polling.** Railway exposes `wss://backboard.railway.com/graphql/v2`. A 4 second interval is adequate at five containers and unworkable at five hundred. Deferred because a subscription requires reconnect handling, backfill on reconnect, and a polling fallback when the socket cannot open.
+
+**Durable creation.** The HTTP request is currently the unit of work, so a request that dies mid-flight leaves a created service with nothing tracking it. The correct shape is to persist an intent record, return immediately, and drive it to a terminal state from a worker with retries and a dead-letter path.
+
+**Per-actor authentication and audit.** A shared secret establishes that a caller was authorised, not which caller acted. Real accounts, plus an append-only record of actor, image, service ID and outcome.
+
+**Cost surfacing.** The console reports what is running but not what it costs. Per-service usage and a projected monthly figure would change how it is used.
+
+**Test coverage.** None currently. The first cases to cover are behavioural rather than structural: allowlist rejection of an unlisted image, ceiling enforcement at the limit, replay of an idempotency key producing one service, and propagation of a GraphQL error message rather than a generic 500.
