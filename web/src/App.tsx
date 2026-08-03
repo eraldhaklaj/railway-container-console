@@ -62,8 +62,8 @@ export default function App() {
     queryFn: fetchContainers,
     enabled: unlocked,
     retry: false,
-    // Poll only while something is still moving. Once every row is in a
-    // terminal state there is nothing to learn by asking again.
+    // Poll only while a deployment can still transition. Once every row is in
+    // a terminal state the interval is cleared.
     refetchInterval: (q) => {
       const rows = q.state.data;
       if (!rows || rows.length === 0) return false;
@@ -71,8 +71,8 @@ export default function App() {
     },
   });
 
-  // An invalid key should send you back to the gate rather than showing an
-  // error you cannot act on.
+  // A rejected key is unrecoverable in place, so clear it and return to the
+  // gate rather than surfacing an unactionable error.
   useEffect(() => {
     const err = (containers.error ?? meta.error) as ApiError | null;
     if (err instanceof ApiError && err.status === 401) {
@@ -99,8 +99,8 @@ export default function App() {
     mutationFn: (serviceId: string) => spinDown(serviceId),
     onMutate: async (serviceId) => {
       setError(null);
-      // Drop it from the list straight away. Deletion is the one action where
-      // waiting for a round trip feels broken, and we reconcile on the refetch.
+      // Remove optimistically: deletion is unambiguous and the refetch in
+      // onSettled reconciles if the request fails.
       await qc.cancelQueries({ queryKey: ["containers"] });
       const previous = qc.getQueryData<Container[]>(["containers"]);
       qc.setQueryData<Container[]>(["containers"], (old) =>
