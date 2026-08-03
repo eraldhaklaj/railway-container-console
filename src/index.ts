@@ -19,10 +19,11 @@ const dirname = path.dirname(fileURLToPath(import.meta.url));
 const webDist = path.join(dirname, "..", "web", "dist");
 
 /* -------------------------------------------------------------------------
- * Auth. The deployed URL is public and every spin-up costs real money on a
- * real account, so the API is gated behind a shared secret. Not sophisticated,
- * but the alternative is leaving a "create infrastructure" button on the open
- * internet, which is the actual mistake.
+ * Shared-secret gate.
+ *
+ * Every endpoint below provisions or destroys billable infrastructure, and the
+ * deployment is reachable on the open internet. A shared secret is the minimum
+ * viable control; see the roadmap in README for the move to per-user auth.
  * ---------------------------------------------------------------------- */
 function requireKey(req: Request, res: Response, next: NextFunction): void {
   const presented = req.get("x-access-key");
@@ -34,13 +35,15 @@ function requireKey(req: Request, res: Response, next: NextFunction): void {
 }
 
 /* -------------------------------------------------------------------------
- * Idempotency. Spin-up is not safe to retry: two identical POSTs create two
- * services and bill for both. Clients send an Idempotency-Key and a repeat
- * within the window returns the original result instead of acting again.
+ * Idempotency for unsafe retries.
  *
- * In-memory is the honest choice for a single-instance demo. The moment this
- * runs on more than one replica it needs to move to Redis or a table, which is
- * noted in the README rather than pretended away.
+ * Service creation is billable and not naturally idempotent: two identical
+ * POSTs produce two services. Callers supply an Idempotency-Key; a repeat
+ * within the TTL replays the original response instead of acting again.
+ *
+ * Constraint: this store is per-process. A replayed key must land on the same
+ * instance to be recognised, so the service must run at one replica until the
+ * store moves to Redis or a uniquely-indexed table.
  * ---------------------------------------------------------------------- */
 const IDEMPOTENCY_TTL_MS = 10 * 60 * 1000;
 const seen = new Map<string, { at: number; body: unknown }>();
@@ -72,7 +75,7 @@ function idempotent(req: Request, res: Response, next: NextFunction): void {
 const api = express.Router();
 api.use(requireKey);
 
-/** What the UI is allowed to offer, so the two never drift apart. */
+/** Surfaces server-side constraints so the client cannot drift from them. */
 api.get("/meta", (_req, res) => {
   res.json({ allowedImages: config.allowedImages, maxContainers: config.maxContainers });
 });
@@ -97,8 +100,9 @@ api.post("/containers", idempotent, async (req, res, next) => {
       res.status(400).json({ error: "An image is required." });
       return;
     }
-    // Allowlist rather than validation: this token can run anything, and an
-    // open image field on a public URL is a crypto miner waiting to happen.
+    // Allowlist rather than format validation. The account token can pull and
+    // run any public image, so an unconstrained field here is arbitrary compute
+    // execution billed to the account owner.
     if (config.allowedImages.length && !config.allowedImages.includes(image)) {
       res.status(400).json({ error: `Image "${image}" is not on the allowlist.` });
       return;
@@ -152,7 +156,7 @@ api.post("/deployments/:deploymentId/stop", async (req, res, next) => {
 
 app.use("/api", api);
 
-/* Unauthenticated, so a platform health check does not need the secret. */
+/* Unauthenticated: platform health checks cannot present the shared secret. */
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
 /* ------------------------------- static UI ------------------------------ */
@@ -163,8 +167,8 @@ app.get("*", (_req, res) => res.sendFile(path.join(webDist, "index.html")));
 /* ------------------------------- errors --------------------------------- */
 
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
-  // Railway's message is the useful one, so pass it through rather than
-  // flattening everything into "something went wrong".
+  // Upstream messages carry the actionable detail (quota, permissions, invalid
+  // image), so they are forwarded rather than collapsed into a generic 500.
   if (err instanceof RailwayError) {
     res.status(err.status).json({ error: err.message });
     return;
