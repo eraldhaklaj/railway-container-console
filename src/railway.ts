@@ -1,10 +1,10 @@
 /**
- * Thin typed client over Railway's public GraphQL API.
+ * Typed client for Railway's public GraphQL API.
  *
- * Everything that touches the account token lives here and only here, on the
- * server. The browser never sees it and never names a project or environment:
- * those come from config, so a caller can only ever act inside the one project
- * this deployment is scoped to.
+ * The account token is confined to this module and never leaves the server.
+ * Project and environment identifiers are supplied by the caller from config
+ * rather than from request input, which bounds every operation to the single
+ * project this deployment is scoped to.
  */
 
 const ENDPOINT = "https://backboard.railway.com/graphql/v2";
@@ -67,7 +67,8 @@ async function gql<T>(
 
   const body = (await res.json().catch(() => ({}))) as GqlResponse<T>;
 
-  // GraphQL reports failures in the body with a 200, so check errors before status.
+  // GraphQL returns 200 with an `errors` array on failure, so the body is
+  // inspected before the HTTP status.
   if (body.errors?.length) {
     throw new RailwayError(body.errors.map((e) => e.message).join("; "));
   }
@@ -160,7 +161,7 @@ export async function listContainers(
   const data = await gql<ServicesQuery>(token, LIST, { projectId });
 
   return data.project.services.edges.map(({ node }) => {
-    // A service has one instance per environment; we only care about ours.
+    // Services carry one instance per environment; select the configured one.
     const instance =
       node.serviceInstances.edges.find((e) => e.node.environmentId === environmentId)?.node ??
       node.serviceInstances.edges[0]?.node;
@@ -217,7 +218,7 @@ const STOP = /* GraphQL */ `
   }
 `;
 
-/** Halts the running deployment but leaves the service in place, so it can be redeployed. */
+/** Halts the active deployment, leaving the service intact for redeploy. */
 export async function stopDeployment(token: string, deploymentId: string): Promise<void> {
   await gql<{ deploymentStop: boolean }>(token, STOP, { id: deploymentId });
 }
